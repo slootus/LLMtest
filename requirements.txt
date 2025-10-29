@@ -1,0 +1,10 @@
+streamlit==1.38.0
+openai>=1.40.0
+requests>=2.31.0
+beautifulsoup4>=4.12.2
+lxml>=5.2.1
+tldextract>=5.1.2
+pandas>=2.2.2
+rapidfuzz>=3.9.7
+xlsxwriter>=3.2.0
+pdfminer.six>=20231228
