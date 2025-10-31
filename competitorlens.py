@@ -1,15 +1,15 @@
-# competitorlens.py (v4) — Price Finder with Location Filters + Unit Switch + Map
+# competitorlens.py (v6) — Minimal UI: single search field, Google-first search
 import re, io, json, math, urllib.parse
-from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import List, Optional, Dict
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import streamlit as st
 import tldextract
 
-st.set_page_config(page_title="CompetitorLens – Price Finder", page_icon="📦", layout="wide")
+st.set_page_config(page_title="CompetitorLens — Minimal", page_icon="🔎", layout="wide")
 
+# Optional: only needed if you toggle LLM refine (disabled by default here)
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")
 try:
     from openai import OpenAI
@@ -17,25 +17,18 @@ try:
 except Exception:
     oai = None
 
-USER_AGENT = "CompetitorLens/0.4"
+USER_AGENT = "CompetitorLens/0.6-min"
 TIMEOUT = 20
 SEARCH_RESULTS = 16
 MAX_PAGES_PER_DOMAIN = 5
 MAX_TOTAL_PAGES = 40
 M2_TO_SQFT = 10.7639
 
-BRAVE_API_KEY = st.secrets.get("BRAVE_API_KEY", "")
+# Search keys
 SERPAPI_API_KEY = st.secrets.get("SERPAPI_API_KEY", "")
-
-# --- Borough centroids for quick map preview ---
-BORO_CENTROIDS = {
-    "Manhattan": (40.7831, -73.9712),
-    "Brooklyn": (40.6782, -73.9442),
-    "Queens": (40.7282, -73.7949),
-    "Bronx": (40.8448, -73.8648),
-    "Staten Island": (40.5795, -74.1502),
-}
-NY_STATE_CENTER = (43.0000, -75.0000)
+GOOGLE_CSE_API_KEY = st.secrets.get("GOOGLE_CSE_API_KEY", "")
+GOOGLE_CSE_CX = st.secrets.get("GOOGLE_CSE_CX", "")
+BRAVE_API_KEY = st.secrets.get("BRAVE_API_KEY", "")
 
 def domain(url: str) -> str:
     x = tldextract.extract(url); return ".".join([x.domain, x.suffix])
@@ -52,30 +45,69 @@ def clean_text(html: str) -> str:
     import re as _re
     return _re.sub(r"\s+"," ", soup.get_text(" ", strip=True))
 
-def parse_intent(prompt: str, unit: str, size_value: float) -> Dict:
-    # respect explicit control from UI; fallback to parsing if size_value not given
+# ---- Intent parsing (size + loose location) ----
+def parse_intent(prompt: str) -> Dict:
+    # size in m² or sq ft, falls back to 10 m² if not found
+    M2_TO_SQFT = 10.7639
     area_m2 = None
-    if unit == "sq ft":
-        area_m2 = float(size_value) / M2_TO_SQFT
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(m2|m²|sqm|square\s*meters?)", prompt, re.I)
+    if m:
+        area_m2 = float(m.group(1))
     else:
-        area_m2 = float(size_value)
-    # Business type detection
+        ft = re.search(r"(\d+(?:\.\d+)?)\s*(sq\s*ft|ft2|square\s*feet?)", prompt, re.I)
+        if ft:
+            area_m2 = float(ft.group(1)) / M2_TO_SQFT
+    if not area_m2:
+        # common 10x10 ft unit (approx 9.3 m²)
+        rect = re.search(r"(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)\s*(?:ft|')", prompt, re.I)
+        if rect:
+            sqft = float(rect.group(1)) * float(rect.group(2))
+            area_m2 = sqft / M2_TO_SQFT
+    area_m2 = area_m2 or 10.0
+
+    # business type detection
     lower = prompt.lower()
     business = "self storage"
     for k in ["mini warehouse","mini-warehouse","mini storage","mini storage units","mini self storage","storage unit","self storage"]:
-        if k in lower: 
+        if k in lower:
             business = "mini warehouse" if "warehouse" in k or "mini" in k else "self storage"
             break
-    # Location heuristic (fallback if UI geography is Custom and prompt contains "in ...")
+
+    # loose location text (used only to build search queries)
     loc = None
     mloc = re.search(r"(?:in|at|near)\s+([A-Za-z ,.&'-]+)", prompt, re.I)
     if mloc:
         raw = mloc.group(1)
         raw = re.split(r"\b(for|by|with|on)\b", raw)[0].strip(" ,.")
         loc = raw
-    return {"business_type": business, "location": loc, "area_m2": area_m2}
 
-# ---- Search providers ----
+    return {"business_type": business, "location_hint": loc, "area_m2": area_m2}
+
+# ---- Google-first search ----
+def search_google_serpapi(q: str, n: int=10) -> List[str]:
+    if not SERPAPI_API_KEY: return []
+    try:
+        r = requests.get("https://serpapi.com/search.json",
+                         params={"engine":"google","q":q,"num":n,"api_key":SERPAPI_API_KEY},
+                         headers={"User-Agent":USER_AGENT}, timeout=TIMEOUT)
+        if r.status_code!=200: return []
+        js = r.json()
+        return [it.get("link") for it in js.get("organic_results",[]) if it.get("link","").startswith("http")]
+    except Exception:
+        return []
+
+def search_google_cse(q: str, n: int=10) -> List[str]:
+    if not GOOGLE_CSE_API_KEY or not GOOGLE_CSE_CX: return []
+    try:
+        r = requests.get("https://www.googleapis.com/customsearch/v1",
+                         params={"key": GOOGLE_CSE_API_KEY, "cx": GOOGLE_CSE_CX, "q": q, "num": min(n,10)},
+                         headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+        if r.status_code!=200: return []
+        js = r.json()
+        return [it.get("link") for it in js.get("items",[]) if it.get("link","").startswith("http")]
+    except Exception:
+        return []
+
 def search_ddgs(q: str, n: int=10) -> List[str]:
     try:
         from duckduckgo_search import DDGS
@@ -103,58 +135,38 @@ def search_brave(q: str, n: int=10) -> List[str]:
     except Exception:
         return []
 
-def search_serp(q: str, n: int=10) -> List[str]:
-    if not SERPAPI_API_KEY: return []
-    try:
-        r = requests.get("https://serpapi.com/search.json",
-                         params={"engine":"google","q":q,"num":n,"api_key":SERPAPI_API_KEY},
-                         headers={"User-Agent":USER_AGENT}, timeout=TIMEOUT)
-        if r.status_code!=200: return []
-        js = r.json()
-        return [it.get("link") for it in js.get("organic_results",[]) if it.get("link","").startswith("http")]
-    except Exception:
-        return []
-
-def queries(biz: str, geo_mode: str, selected_boros: List[str], custom_location: Optional[str], area_m2: float) -> List[str]:
+def build_queries(biz: str, loc_hint: Optional[str], area_m2: float) -> List[str]:
     sqft = int(round(area_m2 * M2_TO_SQFT))
-    base_variants = [
+    bases = [
         f"{biz} pricing {sqft} sq ft",
+        f"{biz} {sqft} sq ft price",
         f"{biz} 10 m² price",
         f"{biz} unit sizes prices",
         f"{biz} rates monthly",
         f"{biz} '10x10' price",
         f"{biz} storage rates pdf",
     ]
-    loc_suffixes = []
-    if geo_mode == "NYC Five Boroughs":
-        loc_suffixes = selected_boros if selected_boros else list(BORO_CENTROIDS.keys())
-    elif geo_mode == "New York State":
-        loc_suffixes = ["New York State", "NY", "Upstate New York", "Long Island"]
-    else:
-        if custom_location:
-            loc_suffixes = [custom_location]
-        else:
-            loc_suffixes = ["New York"]  # sensible fallback
-
-    qs = []
-    for base in base_variants:
-        for loc in loc_suffixes:
-            qs.append(f"{base} {loc}")
-    # Clean duplicates
+    if loc_hint:
+        bases = [f"{b} {loc_hint}" for b in bases]
     seen=set(); out=[]
-    for q in qs:
+    for q in bases:
         q2=" ".join(q.split())
         if q2 not in seen:
             out.append(q2); seen.add(q2)
-    return out[:24]
+    return out
 
 def search_all(qs: List[str], limit:int=SEARCH_RESULTS) -> List[str]:
     urls = []
     for q in qs:
-        urls += search_ddgs(q, n=limit//2)
-        if len(urls) < limit: urls += [u for u in search_brave(q, n=limit//2) if u not in urls]
-        if len(urls) < limit: urls += [u for u in search_serp(q, n=limit//2) if u not in urls]
-        if len(urls) >= limit: break
+        urls += [u for u in search_google_serpapi(q, n=limit//2) if u not in urls]
+        if len(urls) < limit:
+            urls += [u for u in search_google_cse(q, n=limit//2) if u not in urls]
+        if len(urls) < limit:
+            urls += [u for u in search_ddgs(q, n=limit//2) if u not in urls]
+        if len(urls) < limit:
+            urls += [u for u in search_brave(q, n=limit//2) if u not in urls]
+        if len(urls) >= limit:
+            break
     # Deduplicate by domain
     seen, out = set(), []
     for u in urls:
@@ -192,23 +204,6 @@ def nearest_area(text: str, target_m2: float):
         v=min(rect, key=lambda x: abs(x/ M2_TO_SQFT - target_m2)); return v/M2_TO_SQFT, f"{int(round(v))} sq ft (rect)"
     return None, ""
 
-def geo_text_match(text: str, geo_mode: str, selected_boros: List[str], custom_location: Optional[str]) -> bool:
-    t = text.lower()
-    if geo_mode == "NYC Five Boroughs":
-        if not selected_boros:
-            selected_boros = list(BORO_CENTROIDS.keys())
-        hits = [b for b in selected_boros if b.lower() in t]
-        # also allow "New York, NY" or "NYC"
-        if "nyc" in t or "new york, ny" in t:
-            hits.append("NYC")
-        return len(hits) > 0
-    elif geo_mode == "New York State":
-        return any(k in t for k in ["new york", "ny ", "ny,", "ny-"]) and not any(b.lower() in t for b in ["los angeles","chicago","miami","boston"])
-    else:
-        if not custom_location: 
-            return True
-        return custom_location.lower() in t
-
 def extract_offers(site_domain: str, page_url: str, text: str, target_m2: float):
     offers=[]
     for m in RATE_SQFT_RE.finditer(text):
@@ -224,7 +219,7 @@ def extract_offers(site_domain: str, page_url: str, text: str, target_m2: float)
         offers.append([site_domain, page_url, label or "N/A", monthly, "$", "month", ppm2, "matched nearest listed size" if a else "price found but size unspecified"])
     return offers
 
-def crawl_extract(urls: List[str], target_m2: float, geo_mode: str, selected_boros: List[str], custom_location: Optional[str], per_domain:int=MAX_PAGES_PER_DOMAIN):
+def crawl_extract(urls: List[str], target_m2: float, per_domain:int=MAX_PAGES_PER_DOMAIN):
     from collections import deque
     results=[]; seen=set(); counts={}
     for root in urls:
@@ -238,25 +233,13 @@ def crawl_extract(urls: List[str], target_m2: float, geo_mode: str, selected_bor
             r=fetch(u)
             if not r or r.status_code>=400: continue
             txt=clean_text(r.text)
-            if not geo_text_match(txt, geo_mode, selected_boros, custom_location):
-                # try next page
-                soup=BeautifulSoup(r.text, "lxml")
-                for a in soup.find_all("a", href=True):
-                    nu=urllib.parse.urljoin(u, a["href"])
-                    if domain(nu)!=d or nu in seen: continue
-                    if any(p in nu.lower() for p in ["/pricing","/rates","/sizes","/size-guide","/units","/storage","/rent","/reserve","/locations","/ny","/new-york"]):
-                        q.append(nu)
-                pages+=1
-                continue
-
             if any(k in txt.lower() for k in ["pricing","rates","unit sizes","size guide","storage units","rent now","reserve","pricing &"]):
                 results += extract_offers(d, u, txt, target_m2)
-            # enqueue more links from same domain
             soup=BeautifulSoup(r.text, "lxml")
             for a in soup.find_all("a", href=True):
                 nu=urllib.parse.urljoin(u, a["href"])
                 if domain(nu)!=d or nu in seen: continue
-                if any(p in nu.lower() for p in ["/pricing","/rates","/sizes","/size-guide","/units","/storage","/rent","/reserve","/locations","/ny","/new-york"]):
+                if any(p in nu.lower() for p in ["/pricing","/rates","/sizes","/size-guide","/units","/storage","/rent","/reserve","/locations"]):
                     q.append(nu)
             pages+=1
         counts[d]=counts.get(d,0)+pages
@@ -282,93 +265,42 @@ def refine_with_llm(rows, target_m2: float):
     except Exception:
         return rows
 
-# ---- UI ----
-st.title("📦 Price Finder — Mini Warehouses / Self-Storage")
-st.caption("Filters for NYC boroughs / New York State + unit switch.")
-
-with st.sidebar:
-    st.header("⚙️ Settings")
-    geo_mode = st.radio("Geography", ["NYC Five Boroughs", "New York State", "Custom"], index=0)
-    selected_boros = []
-    custom_location = None
-    if geo_mode == "NYC Five Boroughs":
-        selected_boros = st.multiselect("Boroughs", list(BORO_CENTROIDS.keys()), default=list(BORO_CENTROIDS.keys()))
-    elif geo_mode == "Custom":
-        custom_location = st.text_input("Custom location", "New York City, NY")
-    unit = st.radio("Size unit", ["sq ft", "m²"], index=0)
-    size_value = st.number_input(f"Target size ({unit})", min_value=10.0 if unit=="sq ft" else 1.0, value=100.0 if unit=="sq ft" else 10.0, step=10.0 if unit=="sq ft" else 1.0)
-    use_llm = st.checkbox("Use LLM to refine noisy offers", value=True)
+# ---- UI (single field) ----
+st.title("🔎 CompetitorLens — Minimal")
+st.caption("Type a research request. Example: “Find the pricing of mini warehouses in New York for 10m2 warehouses”.")
 
 prompt = st.text_input("Your request", value="Find the pricing of mini warehouses in New York for 10m2 warehouses")
-run = st.button("Run", type="primary")
+use_llm = st.checkbox("Use LLM to refine noisy offers (optional)", value=False)
+run = st.button("Search & Analyze", type="primary")
 
 if run:
-    intent = parse_intent(prompt, unit, size_value)
-    biz, loc, target = intent["business_type"], intent["location"], intent["area_m2"]
-    c1,c2,c3 = st.columns(3)
-    with c1: st.markdown("**Parsed intent**"); st.json(intent)
-    with c2: 
-        st.markdown("**Geography**")
-        st.write({"mode": geo_mode, "boroughs": selected_boros, "custom_location": custom_location})
-    with c3:
-        st.markdown("**Unit & size**")
-        st.write({"unit": unit, "size_input": size_value, "target_m²": round(target,2), "target_sqft": round(target*M2_TO_SQFT,1)})
+    intent = parse_intent(prompt)
+    biz, loc_hint, target = intent["business_type"], intent["location_hint"], intent["area_m2"]
+    st.markdown("**Parsed intent**")
+    st.json(intent)
 
-    st.subheader("1) Find businesses & their websites")
-    qs = queries(biz, geo_mode, selected_boros, custom_location, target)
+    st.subheader("1) Search")
+    qs = build_queries(biz, loc_hint, target)
     st.write(qs)
-    # search now
-    urls = []
-    for q in qs:
-        urls += search_ddgs(q, n=6)
-        if len(urls) >= SEARCH_RESULTS: break
-    if len(urls) < 6:
-        for q in qs:
-            urls += [u for u in search_brave(q, n=6) if u not in urls]
-            if len(urls) >= SEARCH_RESULTS: break
-    if len(urls) < 6:
-        for q in qs:
-            urls += [u for u in search_serp(q, n=6) if u not in urls]
-            if len(urls) >= SEARCH_RESULTS: break
-
-    # Dedup by domain
-    seen, unique_urls = set(), []
-    for u in urls:
-        d=domain(u)
-        if d not in seen:
-            seen.add(d); unique_urls.append(u)
-    urls = unique_urls[:SEARCH_RESULTS]
-
+    urls = search_all(qs, limit=SEARCH_RESULTS)
     if not urls:
-        st.error("No search hits. Try adjusting boroughs or location text.")
+        st.error("No search hits. Try specifying a city or size (e.g., '10x10' or '100 sq ft').")
         st.stop()
 
     with st.expander("Websites to crawl"):
         for u in urls:
             st.write("- ", u)
 
-    # Map preview: plot borough centers or NY state center / custom
-    st.subheader("Map preview")
-    if geo_mode == "NYC Five Boroughs":
-        rows = [{"lat": BORO_CENTROIDS[b][0], "lon": BORO_CENTROIDS[b][1], "name": b} for b in (selected_boros or BORO_CENTROIDS.keys())]
-        st.map(pd.DataFrame(rows, columns=["lat","lon","name"]), latitude="lat", longitude="lon", size=100)
-    elif geo_mode == "New York State":
-        st.map(pd.DataFrame([{"lat": NY_STATE_CENTER[0], "lon": NY_STATE_CENTER[1]}]))
-    else:
-        st.map(pd.DataFrame([{"lat": 40.7128, "lon": -74.0060}]))  # default NYC
-
-    st.subheader("2) Scrape and extract prices (geo-filtered)")
-    rows = crawl_extract(urls, target_m2=target, geo_mode=geo_mode, selected_boros=selected_boros, custom_location=custom_location)
-
+    st.subheader("2) Crawl & extract prices")
+    rows = crawl_extract(urls, target_m2=target)
     if not rows:
-        st.warning("No public prices found for the selected geography. Consider changing boroughs or turning off strict geo filtering.")
+        st.warning("No public prices found. Many providers gate pricing behind ZIP/date. Try different wording (e.g., 'rates', 'unit sizes', '10x10').")
         st.stop()
 
     if use_llm:
         rows = refine_with_llm(rows, target)
 
     df = pd.DataFrame(rows, columns=["Business (domain)","Website","Advertised size","Price amount (monthly USD)","Currency","Period","Price per m² / month (USD)","Notes"])
-
     st.dataframe(df, use_container_width=True)
 
     ser=pd.to_numeric(df["Price per m² / month (USD)"], errors="coerce").dropna()
@@ -376,7 +308,7 @@ if run:
         q1,q3=ser.quantile(0.25), ser.quantile(0.75); iqr=q3-q1
         trimmed=ser[(ser>=q1-1.5*iqr)&(ser<=q3+1.5*iqr)]
         avg=trimmed.mean()
-        st.markdown(f"### ✅ Estimated average for ~{target:.1f} m² ({target*M2_TO_SQFT:.0f} sq ft) in selected area: **${avg:.2f} per m² / month**")
+        st.markdown(f"### ✅ Estimated average for ~{target:.1f} m² (~{target*M2_TO_SQFT:.0f} sq ft): **${avg:.2f} per m² / month**")
         st.markdown(f"That’s roughly **${avg/ M2_TO_SQFT:.2f} per sq ft / month**.")
     else:
         st.info("No normalized prices to compute average.")
